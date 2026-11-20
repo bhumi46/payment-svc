@@ -1,0 +1,142 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  SVC: ${{ github.event.repository.name }}
+  IMAGE: ghcr.io/bhumi46/${{ github.event.repository.name }}
+  CHART_REPO: oci://ghcr.io/bhumi46/charts
+  HELM_VERSION: v4.1.0
+  YQ_VERSION: v4.54.3
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race ./...
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.15.0
+      - uses: azure/setup-helm@v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: helm lint
+        run: helm lint charts/$SVC --strict
+      - name: helm template
+        run: helm template $SVC charts/$SVC --set image.tag=test > /dev/null
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.8.0
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          # amd64 for CI/cloud, arm64 for kind on Apple Silicon.
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  chart:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: azure/setup-helm@v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: push chart if this version is new
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          VERSION=$(yq '.version' charts/$SVC/Chart.yaml)
+          if helm show chart "$CHART_REPO/$SVC" --version "$VERSION" >/dev/null 2>&1; then
+            echo "::notice::chart $SVC $VERSION already published; bump charts/$SVC/Chart.yaml version to publish changes"
+            exit 0
+          fi
+          helm package charts/$SVC --destination dist
+          # GHCR sometimes answers "Tag ... not found" right after creating a new package; retry.
+          for attempt in 1 2 3 4; do
+            helm push "dist/$SVC-$VERSION.tgz" "$CHART_REPO" && exit 0
+            echo "helm push failed, retrying ($attempt)"; sleep $((attempt * 5))
+          done
+          exit 1
+
+  bump-dev:
+    if: github.event_name == 'push'
+    needs: [image, chart]
+    runs-on: ubuntu-24.04
+    concurrency: bump-dev
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: bhumi46/gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+      - name: install yq
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/$YQ_VERSION/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+      - name: set image.tag in envs/dev/${{ env.SVC }}/values.yaml
+        working-directory: gitops
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          FILE="envs/dev/$SVC/values.yaml"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase --quiet origin main
+            if [ ! -f "$FILE" ]; then
+              # New service: the Backstage template's gitops PR adds this file (pinned to the first SHA).
+              echo "::notice::$FILE is not in gitops yet (service not onboarded). Merge the gitops PR; skipping."
+              exit 0
+            fi
+            yq -i '.image.tag = strenv(TAG)' "$FILE"
+            git add "$FILE"
+            if git diff --cached --quiet; then echo "already at $TAG"; exit 0; fi
+            git commit -m "dev: $SVC image.tag -> ${TAG:0:7}" -m "From ${{ github.server_url }}/${{ github.repository }}/commit/$TAG"
+            if OUT=$(git push origin HEAD:main 2>&1); then echo "$OUT"; exit 0; fi
+            echo "$OUT"
+            if ! grep -qE 'rejected|fetch first|non-fast-forward' <<<"$OUT"; then
+              echo "::error::push to bhumi46/gitops failed and it is not a race. Check that GITOPS_TOKEN has write access (Contents: Read and write) to bhumi46/gitops."
+              exit 1
+            fi
+            echo "push raced with another commit, retrying ($attempt)"; git reset --hard --quiet origin/main; sleep $((attempt * 3))
+          done
+          exit 1
